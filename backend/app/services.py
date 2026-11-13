@@ -194,10 +194,10 @@ def _traveler_summary(conn, catalog, row, busy) -> dict:
         view["availability"] = {"available": False, "message": rules.NO_RIDE_MESSAGE,
                                 "reason": "; ".join(p.message for p in problems)}
     counts = conn.execute(
-        "SELECT COUNT(*) AS total, SUM(status = 'OPEN') AS open FROM offers WHERE request_id = ?",
+        "SELECT COUNT(*) AS total, SUM(CASE WHEN status = 'OPEN' THEN 1 ELSE 0 END) AS open FROM offers WHERE request_id = ?",
         (row["request_id"],)).fetchone()
     view["offer_count"] = counts["total"] or 0
-    view["open_offer_count"] = counts["open"] or 0
+    view["open_offer_count"] = int(counts["open"] or 0)
     booking = conn.execute("SELECT booking_no, status FROM bookings WHERE request_id = ? ORDER BY created_at DESC",
                            (row["request_id"],)).fetchone()
     view["booking_no"] = booking["booking_no"] if booking else None

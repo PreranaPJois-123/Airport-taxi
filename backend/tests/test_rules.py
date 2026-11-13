@@ -5,6 +5,8 @@ Run from backend/:  python -m pytest -q
 from datetime import datetime
 from pathlib import Path
 
+import os
+
 import pytest
 
 from app import rules, services
@@ -369,6 +371,7 @@ def test_custom_guarantee_time(conn, catalog):
         assert "hold_minutes" in {e.field for e in exc.value.errors}
 
 
+@pytest.mark.skipif(bool(os.environ.get('DATABASE_URL')), reason='SQLite-only migration test')
 def test_old_database_is_migrated(tmp_path):
     import sqlite3
     c = sqlite3.connect(tmp_path / "old.db")

@@ -2,10 +2,16 @@
 from __future__ import annotations
 
 import json
+import os
+import re
 import sqlite3
 from datetime import datetime
 
 from .config import DB_PATH
+
+# DATABASE_URL (e.g. a Neon connection string) switches storage from SQLite to PostgreSQL.
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+USE_PG = DATABASE_URL.startswith(("postgres://", "postgresql://"))
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ride_requests (
@@ -69,11 +75,120 @@ CREATE TABLE IF NOT EXISTS change_requests (
 """
 
 
+PG_SCHEMA = (SCHEMA.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+             .replace("INTEGER NOT NULL REFERENCES offers(offer_id)", "BIGINT NOT NULL REFERENCES offers(offer_id)"))
+
+
 def now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
-def connect(path=None) -> sqlite3.Connection:
+# ---------------------------------------------------------------------------
+# PostgreSQL support: a thin wrapper that gives psycopg the sqlite3-style API the rest of the
+# code uses (execute / fetchone / lastrowid / row["col"] / commit / rollback).
+# ---------------------------------------------------------------------------
+_PG_LOCK_KEY = 7_340_001          # one advisory lock = SQLite's "BEGIN IMMEDIATE" write lock
+_RETURNING = {"offers": "offer_id", "change_requests": "change_id"}
+_pool = None
+
+
+class PgRow(tuple):
+    """A row that can be read by position and by column name, like sqlite3.Row."""
+    _names: tuple = ()
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            return tuple.__getitem__(self, self._names.index(key))
+        return tuple.__getitem__(self, key)
+
+    def keys(self):
+        return list(self._names)
+
+
+def _row_factory(cursor):
+    names = tuple(c.name for c in (cursor.description or ()))
+    cls = type("PgRow", (PgRow,), {"_names": names})
+    return lambda values: cls(values)
+
+
+def _pg_sql(sql: str) -> tuple[str, str | None]:
+    """Translate the SQLite dialect used here into PostgreSQL. Returns (sql, returning_column)."""
+    sql = sql.replace("%", "%%").replace("?", "%s")
+    if re.match(r"\s*INSERT\s+OR\s+IGNORE", sql, re.I):
+        sql = re.sub(r"INSERT\s+OR\s+IGNORE", "INSERT", sql, count=1, flags=re.I).rstrip().rstrip(";") + " ON CONFLICT DO NOTHING"
+    m = re.match(r"\s*INSERT\s+INTO\s+(\w+)", sql, re.I)
+    returning = _RETURNING.get(m.group(1).lower()) if m else None
+    if returning and "RETURNING" not in sql.upper():
+        sql = sql.rstrip().rstrip(";") + f" RETURNING {returning}"
+    return sql, returning
+
+
+class PgCursor:
+    def __init__(self, cur, returning=None):
+        self._cur, self.lastrowid = cur, None
+        self.rowcount = cur.rowcount
+        if returning:
+            row = cur.fetchone()
+            self.lastrowid = row[0] if row else None
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+    def __iter__(self):
+        return iter(self._cur.fetchall())
+
+
+class PgConnection:
+    def __init__(self, raw, pool=None):
+        self._raw, self._pool = raw, pool
+
+    def execute(self, sql, params=()):
+        stripped = sql.strip().upper()
+        if stripped == "BEGIN IMMEDIATE":     # take the write lock; it is released by commit/rollback
+            self._raw.execute("SELECT pg_advisory_xact_lock(%s)", (_PG_LOCK_KEY,))
+            return None
+        if stripped.startswith("PRAGMA"):
+            return None
+        sql, returning = _pg_sql(sql)
+        return PgCursor(self._raw.execute(sql, tuple(params)), returning)
+
+    def commit(self):
+        self._raw.commit()
+
+    def rollback(self):
+        self._raw.rollback()
+
+    def close(self):
+        try:
+            self._raw.rollback()
+        except Exception:
+            pass
+        if self._pool is not None:
+            self._pool.putconn(self._raw)
+        else:
+            self._raw.close()
+
+
+def _get_pool():
+    global _pool
+    if _pool is None:
+        from psycopg.rows import dict_row  # noqa: F401  (import check)
+        from psycopg_pool import ConnectionPool
+        _pool = ConnectionPool(
+            DATABASE_URL, min_size=1, max_size=int(os.environ.get("DB_POOL_MAX", "8")),
+            kwargs={"row_factory": _row_factory}, check=ConnectionPool.check_connection,
+            max_idle=240, max_lifetime=1800, open=True, timeout=30,
+        )
+    return _pool
+
+
+def connect(path=None):
+    if USE_PG:
+        pool = _get_pool()
+        return PgConnection(pool.getconn(), pool)
     # check_same_thread=False: FastAPI may open the connection (in get_db) on one worker thread
     # and run the endpoint on another. That is safe here because every HTTP request gets its
     # own connection, which is never shared. timeout: wait up to 10 s if another request is writing.
@@ -92,7 +207,14 @@ def get_db():
         conn.close()
 
 
-def init_db(conn: sqlite3.Connection) -> None:
+def init_db(conn) -> None:
+    if USE_PG:
+        conn.execute("SELECT pg_advisory_xact_lock(%s)" % _PG_LOCK_KEY)   # one worker creates the tables
+        for statement in PG_SCHEMA.split(";"):
+            if statement.strip():
+                conn.execute(statement)
+        conn.commit()
+        return
     conn.executescript(SCHEMA)
     # Older databases had offers.expires_at and an EXPIRED status: move them to the guarantee model.
     columns = {row[1] for row in conn.execute("PRAGMA table_info(offers)")}
@@ -109,7 +231,7 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-def seed_open_requests(conn: sqlite3.Connection, open_requests: list[dict]) -> int:
+def seed_open_requests(conn, open_requests: list[dict]) -> int:
     """Load open_requests.json once. INSERT OR IGNORE keeps it safe across restarts."""
     added = 0
     for r in open_requests:
