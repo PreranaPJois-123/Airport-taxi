@@ -179,7 +179,7 @@ def _get_pool():
         from psycopg_pool import ConnectionPool
         _pool = ConnectionPool(
             DATABASE_URL, min_size=1, max_size=int(os.environ.get("DB_POOL_MAX", "8")),
-            kwargs={"row_factory": _row_factory}, check=ConnectionPool.check_connection,
+            kwargs={"row_factory": _row_factory, "prepare_threshold": None}, check=ConnectionPool.check_connection,
             max_idle=240, max_lifetime=1800, open=True, timeout=30,
         )
     return _pool
